@@ -6,8 +6,8 @@
  * Description:       Empower Themes to provide Synced Patterns
  * Requires at least: 6.6
  * Requires PHP:      7.2
- * Version:           1.2.1
- * Author:            Twenty Bellows 
+ * Version:           1.2.2
+ * Author:            Twenty Bellows, WeAre[WP]
  * Author URI:        https://twentybellows.com
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html

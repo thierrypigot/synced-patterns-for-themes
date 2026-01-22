@@ -23,50 +23,118 @@ private static $synced_theme_patterns = [];
 		foreach ($pattern_files as $pattern_file_data) {
 
 			$pattern_slug = $pattern_file_data['slug'];
+			$pattern_file = $pattern_file_data['file'];
 
 			$pattern_post = get_page_by_path(sanitize_title($pattern_slug), OBJECT, 'pb_block');
 
-			self::$synced_theme_patterns[$pattern_slug] = $pattern_post->ID;
-
 			if ( $pattern_post) {
 				$post_id = $pattern_post->ID;
-				$pattern_post->post_title = $pattern_file_data['title'];
-				$pattern_post->post_content = self::render_pattern($pattern_file_data['file']);
-				wp_update_post($pattern_post);
+				self::$synced_theme_patterns[$pattern_slug] = $post_id;
+
+				// Check if the file has been modified
+				$file_mtime = filemtime($pattern_file);
+				$stored_mtime = get_post_meta($post_id, '_pattern_file_mtime', true);
+
+				// If the file hasn't changed, no need to update
+				if ($file_mtime != $stored_mtime) {
+					// File modified, render the pattern and calculate the hash
+					$pattern_content = self::render_pattern($pattern_file);
+					$content_hash = md5($pattern_content);
+					$stored_hash = get_post_meta($post_id, '_pattern_content_hash', true);
+
+					// Check if the content has actually changed
+					if ($content_hash !== $stored_hash) {
+						// Content modified, update the post
+						$pattern_post->post_title = $pattern_file_data['title'];
+						$pattern_post->post_content = $pattern_content;
+						wp_update_post($pattern_post);
+						
+						// Update metadata
+						update_post_meta($post_id, '_pattern_file_mtime', $file_mtime);
+						update_post_meta($post_id, '_pattern_content_hash', $content_hash);
+						update_post_meta($post_id, '_pattern_file_path', $pattern_file);
+					} else {
+						// Content identical despite different filemtime (can happen)
+						update_post_meta($post_id, '_pattern_file_mtime', $file_mtime);
+					}
+				}
+
+				// Check if the title has changed (even if content is identical)
+				if ($pattern_post->post_title !== $pattern_file_data['title']) {
+					$pattern_post->post_title = $pattern_file_data['title'];
+					wp_update_post($pattern_post);
+				}
 			} 
 			else {
+				// New pattern, create the post
+				$pattern_content = self::render_pattern($pattern_file);
+				$file_mtime = filemtime($pattern_file);
+				$content_hash = md5($pattern_content);
+
 				$post_id = wp_insert_post(array(
 					'post_title' => $pattern_file_data['title'],
 					'post_name' => $pattern_slug,
-					'post_content' => self::render_pattern($pattern_file_data['file']),
+					'post_content' => $pattern_content,
 					'post_type' => 'pb_block',
 					'post_status' => 'publish',
 					'ping_status' => 'closed',
 					'comment_status' => 'closed'
 				));
+
+				if ($post_id && !is_wp_error($post_id)) {
+					self::$synced_theme_patterns[$pattern_slug] = $post_id;
+					
+					// Store metadata
+					update_post_meta($post_id, '_pattern_file_mtime', $file_mtime);
+					update_post_meta($post_id, '_pattern_content_hash', $content_hash);
+					update_post_meta($post_id, '_pattern_file_path', $pattern_file);
+				}
 			}
 
-			if (! empty($pattern_file_data['categories'])) {
-				wp_set_object_terms($post_id, $pattern_file_data['categories'], 'wp_pattern_category');
+			// Optimize category updates
+			if (!empty($pattern_file_data['categories']) && isset($post_id) && $post_id) {
+				$current_terms = wp_get_object_terms($post_id, 'wp_pattern_category', array('fields' => 'slugs'));
+				if (is_wp_error($current_terms)) {
+					$current_terms = [];
+				}
+				
+				$new_categories = is_array($pattern_file_data['categories']) 
+					? $pattern_file_data['categories'] 
+					: explode(',', $pattern_file_data['categories']);
+				
+				// Normalize categories (trim)
+				$new_categories = array_map('trim', $new_categories);
+				$new_categories = array_filter($new_categories);
+				
+				// Compare categories
+				sort($current_terms);
+				sort($new_categories);
+				
+				if ($current_terms !== $new_categories) {
+					wp_set_object_terms($post_id, $new_categories, 'wp_pattern_category');
+				}
 			}
 
 			// UN register the unsynced pattern and RE register it with the reference to the synced pattern
 			// this pattern injects a synced pattern block as the content.
 			// and allows it to be used by anything that uses the wp:pattern with its slug
 
-			if ($pattern_registry->is_registered($pattern_slug)) {
-				$pattern_registry->unregister($pattern_slug);
+			// Only continue if post_id is valid
+			if (isset($post_id) && $post_id) {
+				if ($pattern_registry->is_registered($pattern_slug)) {
+					$pattern_registry->unregister($pattern_slug);
+				}
+				
+				$pattern_registry->register(
+					$pattern_slug,
+					array(
+						'title'   => $pattern_file_data['title'],
+						'slug'   => $pattern_slug,
+						'inserter' => false,
+						'content' => '<!-- wp:block {"ref":' . $post_id . '} /-->',
+					)
+				);
 			}
-			
-			$pattern_registry->register(
-				$pattern_slug,
-				array(
-					'title'   => $pattern_file_data['title'],
-					'slug'   => $pattern_slug,
-					'inserter' => false,
-					'content' => '<!-- wp:block {"ref":' . $post_id . '} /-->',
-				)
-			);
 		}
 	}
 
@@ -86,11 +154,15 @@ private static $synced_theme_patterns = [];
 		else if ($request->get_route() === '/wp/v2/blocks') {
 
 			$data = $response->get_data();
+			// Reuse cache instead of calling get_synced_patterns_from_theme_files() again
 			$pattern_files = $this->get_synced_patterns_from_theme_files();
 
 			foreach ($pattern_files as $pattern) {
 				$post = get_page_by_path(sanitize_title($pattern['slug']), OBJECT, 'pb_block');
-				$data[] = $this->format_pb_block_response($post, $request);
+				// Handle case where $post is null
+				if ($post && $post->post_type === 'pb_block') {
+					$data[] = $this->format_pb_block_response($post, $request);
+				}
 			}
 
 			$response->set_data($data);
@@ -142,10 +214,53 @@ private static $synced_theme_patterns = [];
 		return ob_get_clean();
 	}
 
+	/**
+	 * Generates a unique cache key based on the patterns directory
+	 *
+	 * @return string Cache key
+	 */
+	private function get_patterns_cache_key()
+	{
+		$patterns_dir = get_stylesheet_directory() . '/patterns';
+		$cache_key = 'synced_patterns_list_' . md5($patterns_dir);
+		return $cache_key;
+	}
+
+	/**
+	 * Gets the modification time of the patterns directory for cache invalidation
+	 *
+	 * @return int|false Modification timestamp or false if directory doesn't exist
+	 */
+	private function get_patterns_dir_mtime()
+	{
+		$patterns_dir = get_stylesheet_directory() . '/patterns';
+		if (!is_dir($patterns_dir)) {
+			return false;
+		}
+		return filemtime($patterns_dir);
+	}
+
 	private function get_synced_patterns_from_theme_files()
 	{
+		$cache_key = $this->get_patterns_cache_key();
+		$current_dir_mtime = $this->get_patterns_dir_mtime();
+		$cached_dir_mtime = get_transient($cache_key . '_mtime');
+		
+		// Check if cache is valid
+		if ($cached_dir_mtime !== false && $current_dir_mtime !== false && $cached_dir_mtime === $current_dir_mtime) {
+			$cached_patterns = get_transient($cache_key);
+			if ($cached_patterns !== false) {
+				return $cached_patterns;
+			}
+		}
+
+		// Cache invalid or missing, scan files
 		$pattern_files = glob(get_stylesheet_directory() . '/patterns/*.php');
 		$patterns = [];
+
+		if ($pattern_files === false) {
+			$pattern_files = [];
+		}
 
 		foreach ($pattern_files as $pattern_file) {
 			$pattern_data = get_file_data($pattern_file, array(
@@ -170,6 +285,12 @@ private static $synced_theme_patterns = [];
 			$pattern_data['file'] = $pattern_file;
 
 			$patterns[] = $pattern_data;
+		}
+
+		// Cache the results (12 hours)
+		if ($current_dir_mtime !== false) {
+			set_transient($cache_key, $patterns, 12 * HOUR_IN_SECONDS);
+			set_transient($cache_key . '_mtime', $current_dir_mtime, 12 * HOUR_IN_SECONDS);
 		}
 
 		return $patterns;
